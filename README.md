@@ -15,3 +15,44 @@ The script checks out a pinned revision of [Apple's inference code](https://gith
 A successful run saves a color depth image and an NPZ file containing metric depth in `outputs/`. The smoke test checks that both files are present and nonempty.
 
 Apple's [model license](https://github.com/apple-aiml-research/ml-depth-pro-2/blob/aa389cbb0b74341664ed663a0966c859905cd6c0/LICENSE_MODEL) limits weight use to noncommercial scientific research and academic development.
+
+## Export a COLMAP reconstruction
+
+Save Depth Pro 2 predictions with Apple's `--save-npz` option. Create a JSON
+manifest listing the RGB image and its matching depth NPZ for each frame.
+Paths are relative to the manifest, and absolute paths are also accepted.
+
+```json
+{
+  "frames": [
+    {
+      "image": "images/example.jpg",
+      "depth": "predictions/example-depth.npz"
+    }
+  ]
+}
+```
+
+```sh
+uv run --script export-colmap.py frames.json /path/to/new-case
+```
+
+The exporter writes `cameras.bin`, `images.bin`, `points3D.bin`, and
+`points3D.ply` under `gen_video/sparse/0/`. It also writes the rig and frame
+metadata used by current COLMAP versions. It samples every eighth row and
+column by default. Use `--stride` to change the density and `--max-depth` to
+exclude distant finite predictions.
+
+A one-image manifest can use the NPZ focal length and the optical center of
+the image, with the camera as the world origin. For multiple images, supply
+`intrinsics` as `[fx, fy, cx, cy]` in COLMAP pixel coordinates and
+`world_to_camera` as a 3×4 or 4×4 matrix for every frame. Supply undistorted
+RGB images and matching depth maps in the same orientation and resolution.
+Camera translations must be in meters in a common world frame. You can also
+supply these fields for one image to use calibrated geometry.
+
+The COLMAP image name defaults to the input basename. Set `name` per frame
+when the consumer expects a different relative image path. Keep the source
+images available at those paths for downstream tools. Each projected point
+records its source observation. Multi-view feature matching and camera pose
+estimation require a separate stage.
