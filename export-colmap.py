@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["numpy>=1.26", "pillow>=11", "pycolmap>=4.2,<5"]
+# dependencies = ["numpy>=1.26", "pillow>=11", "pillow-heif", "pycolmap>=4.2,<5"]
 # ///
 """Export Depth Pro 2 predictions as a colored COLMAP reconstruction."""
 
@@ -13,7 +13,8 @@ from pathlib import Path, PurePosixPath
 
 import numpy as np
 import pycolmap
-from PIL import Image, ImageOps
+
+from rgb_images import read_rgb
 
 
 GAUSSIAN_PROPERTIES = (
@@ -98,8 +99,8 @@ def add_frame(
     ):
         raise ValueError("image name must be a relative COLMAP image path")
 
-    with Image.open(image_path) as source:
-        rgb = np.asarray(ImageOps.exif_transpose(source).convert("RGB"))
+    with read_rgb(image_path) as source:
+        rgb = np.asarray(source)
     height, width = rgb.shape[:2]
 
     with np.load(manifest_dir / frame["depth"], allow_pickle=False) as prediction:

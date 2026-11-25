@@ -7,28 +7,45 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 import pycolmap
-from PIL import Image, ImageOps
+
+from rgb_images import read_rgb, supported_image_suffixes
 
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-
-
-def prepare_images(image_dir, depth_dir, prepared_dir, database, threads):
-    sources = sorted(
-        image for image in image_dir.iterdir()
-        if image.is_file() and image.suffix.lower() in IMAGE_SUFFIXES
+def discover_inputs(image_dir, depth_dir):
+    if not image_dir.is_dir():
+        raise NotADirectoryError(f"RGB directory does not exist: {image_dir}")
+    if not depth_dir.is_dir():
+        raise NotADirectoryError(f"Depth Pro 2 output directory does not exist: {depth_dir}")
+    files = sorted(
+        path for path in image_dir.rglob("*") if path.is_file()
+        and not any(part.startswith(".") for part in path.relative_to(image_dir).parts)
     )
+    suffixes = supported_image_suffixes()
+    sources = [path for path in files if path.suffix.lower() in suffixes]
     if len(sources) < 2:
-        raise ValueError("pose estimation requires at least two overlapping RGB images")
-    if len({source.stem for source in sources}) != len(sources):
-        raise ValueError("RGB basenames must be unique without their extensions")
+        example_files = ", ".join(str(path.relative_to(image_dir)) for path in files[:8])
+        raise ValueError(
+            f"found {len(sources)} supported RGB images under {image_dir} (including subfolders). "
+            f"At least two are required. Files seen: {example_files or '(none)'}."
+        )
+    pairs = [(source, depth_dir / f"{source.stem}-depth.npz") for source in sources]
+    if len({source.stem.casefold() for source in sources}) != len(sources):
+        raise ValueError("RGB basenames must be unique across subfolders to match Depth Pro 2 NPZs")
+    missing = [f"{source.relative_to(image_dir)} -> {depth.name}" for source, depth in pairs
+               if not depth.is_file()]
+    if missing:
+        raise ValueError(
+            f"found {len(sources)} RGB images, but {len(missing)} have no matching NPZ in {depth_dir}: "
+            + ", ".join(missing[:8])
+        )
+    return pairs
 
+
+def prepare_images(image_dir, pairs, prepared_dir, database, threads):
     extraction = pycolmap.FeatureExtractionOptions(num_threads=threads)
     frames = {}
-    for index, source in enumerate(sources):
-        depth_path = depth_dir / f"{source.stem}-depth.npz"
-        with Image.open(source) as original, np.load(depth_path, allow_pickle=False) as prediction:
-            rgb = ImageOps.exif_transpose(original).convert("RGB")
+    for index, (source, depth_path) in enumerate(pairs):
+        with read_rgb(source) as rgb, np.load(depth_path, allow_pickle=False) as prediction:
             width, height = rgb.size
             focal = float(prediction["focallength_px"].item())
             if prediction["depth"].shape != (height, width):
@@ -51,7 +68,10 @@ def prepare_images(image_dir, depth_dir, prepared_dir, database, threads):
             extraction_options=extraction,
             device=pycolmap.Device.cpu,
         )
-        frames[name] = {"image": str(source), "depth": str(depth_path)}
+        frames[name] = {
+            "image": str(source), "depth": str(depth_path),
+            "name": source.relative_to(image_dir).as_posix(),
+        }
     return frames
 
 
@@ -120,13 +140,18 @@ def estimate_poses(image_dir, depth_dir, manifest_path, threads):
     if manifest_path.exists():
         raise FileExistsError(f"manifest already exists: {manifest_path}")
 
+    pairs = discover_inputs(image_dir, depth_dir)
+    print(f"Found {len(pairs)} RGB images with matching depth NPZs:", flush=True)
+    for source, _ in pairs:
+        print(f"  {source.relative_to(image_dir)}", flush=True)
+
     with TemporaryDirectory() as scratch:
         scratch = Path(scratch)
         database = scratch / "features.db"
         prepared_dir, model_dir = scratch / "images", scratch / "models"
         prepared_dir.mkdir()
         model_dir.mkdir()
-        frames = prepare_images(image_dir, depth_dir, prepared_dir, database, threads)
+        frames = prepare_images(image_dir, pairs, prepared_dir, database, threads)
         model, registered = recover_reconstruction(database, prepared_dir, model_dir, frames, threads)
         scale, observations, depth_error = estimate_metric_scale(model, registered, frames)
 

@@ -11,8 +11,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pycolmap
 from matplotlib.colors import LogNorm
-from PIL import Image, ImageOps
 from plyfile import PlyData
+
+from rgb_images import read_rgb
 
 
 def read_splats(path):
@@ -91,8 +92,7 @@ def preview(manifest, case_dir, output, shift):
     if camera.model_name != "PINHOLE":
         raise ValueError("the preview expects the undistorted PINHOLE camera exported by this repo")
 
-    with Image.open(source_path) as source:
-        original = ImageOps.exif_transpose(source).convert("RGB")
+    original = read_rgb(source_path)
     with np.load(manifest.parent / frame["depth"], allow_pickle=False) as prediction:
         depth = prediction["depth"]
     if original.size != (camera.width, camera.height) or depth.shape != original.size[::-1]:

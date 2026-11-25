@@ -67,6 +67,12 @@ Run Depth Pro 2 on the source images with `--save-npz` first. Then run:
 .upstream/.venv/bin/python export-colmap.py outputs/frames.json outputs/joint-case --gaussian-ply --stride 4
 ```
 
+The pose estimator searches the source directory and its subfolders. Put one
+`<image-stem>-depth.npz` per source image directly in the depth output
+directory, and use distinct image stems across subfolders. For nested images,
+pass the individual paths to Depth Pro 2 with repeated `-i` options so their
+NPZs land in that same directory.
+
 The pose estimator uses CPU COLMAP feature matching and structure from motion.
 It takes the initial pinhole intrinsics from Depth Pro 2's per-image focal
 length and holds them fixed. The manifest contains one world-to-camera
