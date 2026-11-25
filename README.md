@@ -89,6 +89,30 @@ Gaussian renders. The preview runs on CPU and uses the camera from the
 COLMAP export. Use `--shift-m` to change the second camera's offset, which
 defaults to 0.65 m to the right.
 
+## Render Apple-style novel views with TMPI on CUDA
+
+For the method in Appendix D.2 of the Depth Pro 2 paper, run
+[TMPI](https://github.com/facebookresearch/TMPI) on the RGB image and raw depth
+NPZ. This uses TMPI's released four-plane checkpoint and PyTorch rasterizer
+and saves a novel-view MP4. It uses the CUDA-enabled PyTorch environment you
+already installed for Depth Pro 2.
+
+```sh
+git clone https://github.com/facebookresearch/TMPI.git .tmpi
+git -C .tmpi checkout --detach 2847eb42c165073badabda446654a06464ab7602
+.upstream/.venv/bin/python -m pip install scipy tqdm
+.upstream/.venv/bin/python render-tmpi.py \
+  .upstream/assets/example.jpg outputs/pip-test/example-depth.npz \
+  outputs/pip-test/tmpi-preview.mp4 --max-side 1024 --frames 30
+```
+
+The TMPI checkout includes the renderer's weights. The wrapper uses the
+existing Depth Pro 2 NPZ, so it skips TMPI's DPT setup. The command above
+reduces resolution and frame count for a first run. Omit those two options
+for a long-side cap of 4096 pixels and a 90-frame loop. The wrapper uses the
+paper's disparity clipping and fixed intrinsics and the released TMPI demo's
+camera path. The figure in Apple’s paper uses Depth Pro 2 H+ on DIS5K images.
+
 ## Run the sample offline after installing with pip
 
 From the repository root, install Apple's source into a virtual environment:
