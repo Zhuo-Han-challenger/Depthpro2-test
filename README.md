@@ -73,3 +73,23 @@ layout of DA3's default Gaussian exporter.
 The splats are a deterministic initialization from the visible surfaces.
 Novel-view quality depends on scene coverage and any subsequent Gaussian
 optimization. Rendered videos and novel camera trajectories require a renderer.
+
+## Run the sample offline after installing with pip
+
+From the repository root, install Apple's source into a virtual environment:
+
+```sh
+(
+  cd .upstream &&
+  python3 -m venv .venv &&
+  .venv/bin/python -m pip install .
+)
+```
+
+Upload both files listed in [checkpoints](checkpoints/README.md) to the
+visible `checkpoints/` folder. The Apple source must already be checked
+out under `.upstream/`. Then run:
+
+```sh
+bash run-offline.sh
+```
