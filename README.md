@@ -74,6 +74,21 @@ The splats are a deterministic initialization from the visible surfaces.
 Novel-view quality depends on scene coverage and any subsequent Gaussian
 optimization. Rendered videos and novel camera trajectories require a renderer.
 
+## Render a preview from the terminal
+
+For an exported case that contains `3dgs.ply`, run this from the repository
+root using the existing pip environment:
+
+```sh
+.upstream/.venv/bin/python -m pip install matplotlib plyfile 'pycolmap>=4.2,<5'
+.upstream/.venv/bin/python render-preview.py frames.json /path/to/case outputs/preview.png
+```
+
+The PNG compares the first frame's source image, dense metric depth and two
+Gaussian renders. The preview runs on CPU and uses the camera from the
+COLMAP export. Use `--shift-m` to change the second camera's offset, which
+defaults to 0.65 m to the right.
+
 ## Run the sample offline after installing with pip
 
 From the repository root, install Apple's source into a virtual environment:
