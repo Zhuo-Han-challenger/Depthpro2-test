@@ -56,3 +56,20 @@ when the consumer expects a different relative image path. Keep the source
 images available at those paths for downstream tools. Each projected point
 records its source observation. Multi-view feature matching and camera pose
 estimation require a separate stage.
+
+## Export Gaussian splats
+
+```sh
+uv run --script export-colmap.py frames.json /path/to/new-case --gaussian-ply
+```
+
+This adds `gen_video/sparse/0/3dgs.ply` alongside the COLMAP cameras and
+point cloud. Each sampled, valid depth pixel initializes one Gaussian in the
+same world frame as the exported cameras. The exporter uses the pixel color,
+an initial opacity of 0.9, and a camera-aligned footprint based on depth,
+focal length, and `--stride`. It uses the degree-zero spherical-harmonic PLY
+layout of DA3's default Gaussian exporter.
+
+The splats are a deterministic initialization from the visible surfaces.
+Novel-view quality depends on scene coverage and any subsequent Gaussian
+optimization. Rendered videos and novel camera trajectories require a renderer.

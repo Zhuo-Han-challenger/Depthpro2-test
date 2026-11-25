@@ -6,12 +6,48 @@
 
 import argparse
 import json
+import shutil
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 
 import numpy as np
 import pycolmap
 from PIL import Image, ImageOps
+
+
+GAUSSIAN_PROPERTIES = (
+    "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2", "opacity",
+    "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+)
+SH_DC_CONSTANT = 1 / np.sqrt(4 * np.pi)
+
+
+def write_gaussian_vertices(stream, points, colors, depth, focal_lengths, stride, camera_to_world):
+    vertices = np.zeros((len(points), len(GAUSSIAN_PROPERTIES)), dtype="<f4")
+    vertices[:, :3] = points
+    vertices[:, 6:9] = (colors / 255.0 - 0.5) / SH_DC_CONSTANT
+    vertices[:, 9] = np.log(9.0)  # Logit of the initial opacity, 0.9.
+
+    # Half the spacing between depth samples, with a thinner camera-space z axis.
+    log_footprint = np.log(depth[:, None]) + np.log(stride / 2) - np.log(focal_lengths)
+    vertices[:, 10:12] = log_footprint
+    vertices[:, 12] = log_footprint.min(axis=1) - np.log(4.0)
+
+    # PyCOLMAP quaternions are xyzw. Gaussian PLY stores wxyz in world axes.
+    qx, qy, qz, qw = camera_to_world.rotation.quat
+    vertices[:, 13:] = (qw, qx, qy, qz)
+    stream.write(vertices.tobytes())
+
+
+def write_gaussian_ply(path, body, count):
+    header = ["ply", "format binary_little_endian 1.0", f"element vertex {count}"]
+    header.extend(f"property float {name}" for name in GAUSSIAN_PROPERTIES)
+    header.append("end_header\n")
+    body.seek(0)
+    with path.open("wb") as output:
+        output.write("\n".join(header).encode("ascii"))
+        shutil.copyfileobj(body, output)
 
 
 def load_calibration(frame, prediction, width, height, single_view):
@@ -48,7 +84,9 @@ def load_calibration(frame, prediction, width, height, single_view):
     return intrinsics, pose
 
 
-def add_frame(reconstruction, frame, manifest_dir, frame_id, single_view, stride, max_depth):
+def add_frame(
+    reconstruction, frame, manifest_dir, frame_id, single_view, stride, max_depth, gaussian_body
+):
     image_path = manifest_dir / frame["image"]
     name = frame.get("name", image_path.name)
     if (
@@ -83,7 +121,8 @@ def add_frame(reconstruction, frame, manifest_dir, frame_id, single_view, stride
     fx, fy, cx, cy = intrinsics
     x, y = keypoints.T
     camera_points = np.column_stack(((x - cx) * z / fx, (y - cy) * z / fy, z))
-    world_points = pose.inverse() * camera_points
+    camera_to_world = pose.inverse()
+    world_points = camera_to_world * camera_points
     if not np.isfinite(world_points).all() or np.any(
         np.abs(world_points) > np.finfo(np.float32).max
     ):
@@ -96,14 +135,19 @@ def add_frame(reconstruction, frame, manifest_dir, frame_id, single_view, stride
     image = pycolmap.Image(name=name, keypoints=keypoints, camera_id=frame_id, image_id=frame_id)
     reconstruction.add_image_with_trivial_frame(image, pose)
 
-    for index, (point, color) in enumerate(zip(world_points, rgb[rows, cols], strict=True)):
+    colors = rgb[rows, cols]
+    for index, (point, color) in enumerate(zip(world_points, colors, strict=True)):
         track = pycolmap.Track()
         track.add_element(frame_id, index)
         reconstruction.add_point3D(point, track, color)
+    if gaussian_body is not None:
+        write_gaussian_vertices(
+            gaussian_body, world_points, colors, z, intrinsics[:2], stride, camera_to_world
+        )
     return name
 
 
-def export(manifest, case_dir, stride, max_depth):
+def export(manifest, case_dir, stride, max_depth, gaussian_ply=False):
     frames = json.loads(manifest.read_text(encoding="utf-8"))["frames"]
     if not isinstance(frames, list) or not frames:
         raise ValueError("manifest must contain a nonempty frames list")
@@ -112,27 +156,32 @@ def export(manifest, case_dir, stride, max_depth):
         raise FileExistsError(f"export destination already exists: {output_dir}")
 
     reconstruction = pycolmap.Reconstruction()
-    names = set()
-    for frame_id, frame in enumerate(frames, start=1):
-        name = add_frame(
-            reconstruction, frame, manifest.parent, frame_id, len(frames) == 1, stride, max_depth
-        )
-        if name in names:
-            raise ValueError(f"duplicate COLMAP image name: {name}")
-        names.add(name)
-    if not reconstruction.num_points3D():
-        raise ValueError("no sampled pixels have valid depth")
-    if not reconstruction.is_valid():
-        raise ValueError("generated COLMAP reconstruction is inconsistent")
+    with (tempfile.TemporaryFile() if gaussian_ply else nullcontext()) as gaussian_body:
+        names = set()
+        for frame_id, frame in enumerate(frames, start=1):
+            name = add_frame(
+                reconstruction, frame, manifest.parent, frame_id, len(frames) == 1,
+                stride, max_depth, gaussian_body,
+            )
+            if name in names:
+                raise ValueError(f"duplicate COLMAP image name: {name}")
+            names.add(name)
+        point_count = reconstruction.num_points3D()
+        if not point_count:
+            raise ValueError("no sampled pixels have valid depth")
+        if not reconstruction.is_valid():
+            raise ValueError("generated COLMAP reconstruction is inconsistent")
 
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=output_dir.parent) as tmp:
-        staged = Path(tmp) / "model"
-        staged.mkdir()
-        reconstruction.write_binary(staged)
-        reconstruction.export_PLY(staged / "points3D.ply")
-        staged.rename(output_dir)
-    return output_dir, reconstruction.num_points3D()
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output_dir.parent) as tmp:
+            staged = Path(tmp) / "model"
+            staged.mkdir()
+            reconstruction.write_binary(staged)
+            reconstruction.export_PLY(staged / "points3D.ply")
+            if gaussian_body is not None:
+                write_gaussian_ply(staged / "3dgs.ply", gaussian_body, point_count)
+            staged.rename(output_dir)
+    return output_dir, point_count
 
 
 def main():
@@ -141,16 +190,21 @@ def main():
     parser.add_argument("case_dir", type=Path, help="write under CASE_DIR/gen_video/sparse/0")
     parser.add_argument("--stride", type=int, default=8, help="pixel spacing for point sampling")
     parser.add_argument("--max-depth", type=float, default=np.inf, help="maximum depth in meters")
+    parser.add_argument("--gaussian-ply", action="store_true", help="also write 3dgs.ply")
     args = parser.parse_args()
     if args.stride < 1:
         parser.error("--stride must be positive")
     if np.isnan(args.max_depth) or args.max_depth <= 0:
         parser.error("--max-depth must be positive")
     try:
-        output_dir, point_count = export(args.manifest, args.case_dir, args.stride, args.max_depth)
+        output_dir, point_count = export(
+            args.manifest, args.case_dir, args.stride, args.max_depth, args.gaussian_ply
+        )
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         parser.exit(1, f"Export failed: {exc}\n")
     print(f"Exported {point_count:,} points to {output_dir}")
+    if args.gaussian_ply:
+        print(f"Wrote {point_count:,} Gaussian splats to {output_dir / '3dgs.ply'}")
 
 
 if __name__ == "__main__":
