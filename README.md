@@ -83,8 +83,12 @@ metric units. The depth maps retain their original values. The manifest
 records the number of observations and their median depth disagreement.
 
 Use undistorted images of the same scene with overlapping detail and camera
-movement. The pose estimator stops if COLMAP cannot register every input
-image in one model. The combined `3dgs.ply` seeds Gaussians from all views in
+movement. If COLMAP leaves a view unregistered, the estimator tries different
+initial image pairs and then localizes missing views against triangulated
+points or Depth Pro 2 points from registered views. The manifest marks each
+pose's source and records the inlier count and median reprojection error for
+depth-assisted poses. The estimator stops if it cannot recover every pose
+in a shared frame. The combined `3dgs.ply` seeds Gaussians from all views in
 that coordinate frame.
 
 ## Export Gaussian splats

@@ -87,39 +87,68 @@ def recover_reconstruction(database, prepared_dir, model_dir, frames, threads):
     options.mapper.abs_pose_refine_focal_length = False
     options.mapper.init_min_tri_angle = 4.0
     options.triangulation.ignore_two_view_tracks = False
-    models = pycolmap.incremental_mapping(database, prepared_dir, model_dir, options=options)
+    def map_images(output):
+        return pycolmap.incremental_mapping(database, prepared_dir, output, options=options)
 
+    best_model = None
     best_registered = {}
-    for model in sorted(models.values(), key=lambda candidate: -candidate.num_reg_images()):
+    def keep_model(model):
+        nonlocal best_model, best_registered
         registered = {model.images[index].name: model.images[index] for index in model.reg_image_ids()}
-        if set(registered) == set(frames):
-            return model, registered
         if len(registered) > len(best_registered):
+            best_model = model
             best_registered = registered
-    missing = ", ".join(Path(frames[name]["image"]).name for name in frames if name not in best_registered)
-    raise ValueError(
-        f"COLMAP registered {len(best_registered)}/{len(frames)} images in its best model. "
-        f"Unregistered: {missing}. Check for shared textured features and camera baseline."
-    )
+
+    for model in map_images(model_dir).values():
+        keep_model(model)
+    if len(best_registered) == len(frames):
+        return best_model, best_registered
+
+    with pycolmap.Database.open(database) as db:
+        names = {image.image_id: image.name for image in db.read_all_images()}
+        pair_ids, counts = db.read_two_view_geometry_num_inliers()
+    ranked_pairs = sorted(zip(counts, pair_ids), reverse=True)
+    tried = 0
+    for count, pair_id in ranked_pairs:
+        first, second = pycolmap.pair_id_to_image_pair(pair_id)
+        if count < options.min_num_matches or {names[first], names[second]} <= best_registered.keys():
+            continue
+        print(f"Trying a different COLMAP seed ({count} verified matches): "
+              f"{frames[names[first]]['name']} + {frames[names[second]]['name']}", flush=True)
+        options.init_image_id1, options.init_image_id2 = first, second
+        attempt = model_dir / f"seed-{first}-{second}"
+        attempt.mkdir()
+        for model in map_images(attempt).values():
+            keep_model(model)
+        tried += 1
+        if len(best_registered) == len(frames) or tried == 3:
+            break
+
+    if len(best_registered) < 2:
+        raise ValueError("COLMAP could not establish a shared coordinate frame from any image pair")
+    return best_model, best_registered
+
+
+def depth_at(path, pixels):
+    x, y = np.floor(pixels).astype(np.int64).T
+    with np.load(path, allow_pickle=False) as prediction:
+        depth = prediction["depth"]
+        valid = (x >= 0) & (x < depth.shape[1]) & (y >= 0) & (y < depth.shape[0])
+        samples = np.full(len(pixels), np.nan)
+        samples[valid] = depth[y[valid], x[valid]]
+    return samples
 
 
 def estimate_metric_scale(model, registered, frames):
     log_ratios = []
     observations = 0
-    for name, frame in frames.items():
-        image = registered[name]
+    for name, image in registered.items():
         linked = [point for point in image.points2D if point.has_point3D()]
         if not linked:
             continue
-        pixels = np.floor([point.xy for point in linked]).astype(np.int64)
         world_points = np.array([model.points3D[point.point3D_id].xyz for point in linked])
         z = (image.cam_from_world() * world_points)[:, 2]
-        with np.load(frame["depth"], allow_pickle=False) as prediction:
-            depth = prediction["depth"]
-            x, y = pixels.T
-            in_image = (x >= 0) & (x < depth.shape[1]) & (y >= 0) & (y < depth.shape[0])
-            depth_samples = depth[y[in_image], x[in_image]]
-        z = z[in_image]
+        depth_samples = depth_at(frames[name]["depth"], np.array([point.xy for point in linked]))
         valid = np.isfinite(z) & (z > 0) & np.isfinite(depth_samples) & (depth_samples > 0)
         if valid.any():
             log_ratios.append(np.log(depth_samples[valid].astype(np.float64)) - np.log(z[valid]))
@@ -134,6 +163,101 @@ def estimate_metric_scale(model, registered, frames):
         raise ValueError("could not compute a finite positive metric scale")
     median_relative_error = float(np.median(np.abs(np.expm1(median - samples))))
     return scale, observations, median_relative_error
+
+
+def localize_missing_views(database, model, registered, frames, scale):
+    """Localize missing views against metric points anchored by already registered cameras."""
+    poses, cameras, diagnostics = {}, {}, {}
+    for name, image in registered.items():
+        pose = image.cam_from_world()
+        poses[name] = pycolmap.Rigid3d(pose.rotation, pose.translation * scale)
+        cameras[name] = model.cameras[image.camera_id]
+    if len(poses) == len(frames):
+        return poses, cameras, diagnostics
+
+    with pycolmap.Database.open(database) as db:
+        db_images = {image.name: image for image in db.read_all_images()}
+        for name, frame in frames.items():
+            if name in registered:
+                continue
+            target = db_images[name]
+            camera = db.read_camera(target.camera_id)
+            target_xy = db.read_keypoints(target.image_id)[:, :2].astype(np.float64)
+            groups = []
+            for ref_name, ref in registered.items():
+                if not db.exists_two_view_geometry(ref.image_id, target.image_id):
+                    continue
+                matches = db.read_two_view_geometry(ref.image_id, target.image_id).inlier_matches
+                if not len(matches):
+                    continue
+                ref_ids, target_ids = matches.T
+                ref_xy = db.read_keypoints(ref.image_id)[ref_ids, :2].astype(np.float64)
+                z = depth_at(frames[ref_name]["depth"], ref_xy)
+                valid_depth = np.isfinite(z) & (z > 0)
+                fx, fy, cx, cy = cameras[ref_name].params
+                rays = (ref_xy[valid_depth] - [cx, cy]) / [fx, fy]
+                points = np.full((len(matches), 3), np.nan)
+                points[valid_depth] = poses[ref_name].inverse() * (
+                    np.column_stack((rays, np.ones(len(rays)))) * z[valid_depth, None]
+                )
+                # Prefer triangulated geometry where the reference keypoint has a sparse track.
+                for row, ref_id in enumerate(ref_ids):
+                    point = ref.points2D[int(ref_id)]
+                    if point.has_point3D():
+                        points[row] = model.points3D[point.point3D_id].xyz * scale
+                valid = np.isfinite(points).all(axis=1)
+                if valid.any():
+                    groups.append((target_ids[valid], points[valid]))
+
+            estimate = choose_absolute_pose(camera, target_xy, groups)
+            if estimate is None:
+                count = len(np.unique(np.concatenate([ids for ids, _ in groups]))) if groups else 0
+                raise ValueError(
+                    f"COLMAP registered {len(registered)}/{len(frames)} views. "
+                    f"Cannot reliably localize {frame['name']} from {count} matched keypoints "
+                    "with usable 3D geometry. Check overlap on stationary, textured surfaces."
+                )
+            poses[name], diagnostics[name] = estimate
+            cameras[name] = camera
+            print(f"Localized {frame['name']} with depth-assisted PnP: "
+                  f"{diagnostics[name]['inliers']} inliers", flush=True)
+    return poses, cameras, diagnostics
+
+
+def choose_absolute_pose(camera, target_xy, groups):
+    if not groups:
+        return None
+    ids = np.concatenate([group[0] for group in groups])
+    xyz = np.concatenate([group[1] for group in groups])
+    _, unique = np.unique(ids, return_index=True)
+    if len(unique) < 30:
+        return None
+    pixels = target_xy[ids]
+    max_error = float(np.clip(max(camera.width, camera.height) * 0.003, 3, 12))
+    options = pycolmap.AbsolutePoseEstimationOptions()
+    options.ransac.max_error = max_error
+    best = None
+    for subset_ids, subset_xyz in [*groups, (ids[unique], xyz[unique])]:
+        if len(subset_ids) < 30:
+            continue
+        result = pycolmap.estimate_and_refine_absolute_pose(
+            target_xy[subset_ids], subset_xyz, camera, estimation_options=options
+        )
+        if result is None:
+            continue
+        pose = result["cam_from_world"]
+        camera_xyz = pose * xyz
+        reprojection = camera.img_from_cam(camera_xyz, check_cheirality=False)
+        errors = np.linalg.norm(reprojection - pixels, axis=1)
+        inliers = (camera_xyz[:, 2] > 0) & (errors <= max_error)
+        count = len(np.unique(ids[inliers]))
+        if count < max(30, 0.25 * len(unique)):
+            continue
+        median_error = float(np.median(errors[inliers]))
+        score = (count, -median_error)
+        if best is None or score > best[0]:
+            best = (score, pose, {"inliers": count, "median_reprojection_px": median_error})
+    return None if best is None else best[1:]
 
 
 def estimate_poses(image_dir, depth_dir, manifest_path, threads):
@@ -154,15 +278,14 @@ def estimate_poses(image_dir, depth_dir, manifest_path, threads):
         frames = prepare_images(image_dir, pairs, prepared_dir, database, threads)
         model, registered = recover_reconstruction(database, prepared_dir, model_dir, frames, threads)
         scale, observations, depth_error = estimate_metric_scale(model, registered, frames)
-
-        # Express the reconstruction in the first camera's axes and give translations metric scale.
-        origin = registered[next(iter(frames))].cam_from_world().inverse()
+        poses, cameras, pnp = localize_missing_views(database, model, registered, frames, scale)
+        origin = poses[next(iter(frames))].inverse()
         for name, frame in frames.items():
-            image = registered[name]
-            pose = (image.cam_from_world() * origin).matrix()
-            pose[:, 3] *= scale
-            frame["intrinsics"] = model.cameras[image.camera_id].params.tolist()
-            frame["world_to_camera"] = pose.tolist()
+            frame["intrinsics"] = cameras[name].params.tolist()
+            frame["world_to_camera"] = (poses[name] * origin).matrix().tolist()
+            frame["pose_source"] = "depth_pnp" if name in pnp else "colmap"
+            if name in pnp:
+                frame["pnp"] = pnp[name]
 
     manifest = {
         "frames": list(frames.values()),
