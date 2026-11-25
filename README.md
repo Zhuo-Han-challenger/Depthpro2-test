@@ -57,6 +57,30 @@ images available at those paths for downstream tools. Each projected point
 records its source observation. Multi-view feature matching and camera pose
 estimation require a separate stage.
 
+## Estimate camera poses from overlapping images
+
+Run Depth Pro 2 on the source images with `--save-npz` first. Then run:
+
+```sh
+.upstream/.venv/bin/python -m pip install 'pycolmap>=4.2,<5'
+.upstream/.venv/bin/python estimate-poses.py /path/to/images /path/to/depth-npzs outputs/frames.json
+.upstream/.venv/bin/python export-colmap.py outputs/frames.json outputs/joint-case --gaussian-ply --stride 4
+```
+
+The pose estimator uses CPU COLMAP feature matching and structure from motion.
+It takes the initial pinhole intrinsics from Depth Pro 2's per-image focal
+length and holds them fixed. The manifest contains one world-to-camera
+matrix and four intrinsics per image. The first image defines the coordinate
+origin. A single scale estimated from triangulated observations and their
+matching Depth Pro 2 predictions gives the camera translations approximate
+metric units. The depth maps retain their original values. The manifest
+records the number of observations and their median depth disagreement.
+
+Use undistorted images of the same scene with overlapping detail and camera
+movement. The pose estimator stops if COLMAP cannot register every input
+image in one model. The combined `3dgs.ply` seeds Gaussians from all views in
+that coordinate frame.
+
 ## Export Gaussian splats
 
 ```sh
